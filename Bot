@@ -1,0 +1,173 @@
+import os
+import json
+import asyncio
+from datetime import datetime, timedelta
+
+from nio import AsyncClient, MatrixRoom, RoomMessageText, LoginResponse
+
+# === Configuration ===
+HOMESERVER = "https://your.matrix.server"
+USER_ID = "@timekeeper:your.matrix.server"
+PASSWORD = "yourpassword"
+DATA_DIR = "/opt/matrix-bots/timekeeper-bot/data/"
+
+# === Privileged Users (can view all data) ===
+VIEW_USERS = {"ben", "eli"}  # Match display name (case-insensitive)
+
+# === Internal State ===
+client = AsyncClient(HOMESERVER, USER_ID)
+active_sessions = {}
+waiting_for_memo = {}
+
+# === File Helpers ===
+def get_user_path(user_id):
+    return os.path.join(DATA_DIR, user_id.replace(":", "_"))
+
+def get_day_file(user_id):
+    today = datetime.utcnow().date().isoformat()
+    return os.path.join(get_user_path(user_id), f"{today}.json")
+
+def ensure_user_dir(user_id):
+    os.makedirs(get_user_path(user_id), exist_ok=True)
+
+def save_log(user_id, log_entry):
+    ensure_user_dir(user_id)
+    file = get_day_file(user_id)
+    try:
+        with open(file, "r") as f:
+            logs = json.load(f)
+    except FileNotFoundError:
+        logs = []
+    logs.append(log_entry)
+    with open(file, "w") as f:
+        json.dump(logs, f, indent=2)
+
+def get_display_name(room: MatrixRoom, user_id: str) -> str:
+    member = room.members.get(user_id)
+    return member.display_name if member and member.display_name else user_id
+
+# === Time Tracking ===
+def start_timer(user_id):
+    active_sessions[user_id] = {"start": datetime.utcnow(), "elapsed": timedelta()}
+    return "Timer started."
+
+def pause_timer(user_id):
+    session = active_sessions.get(user_id)
+    if not session or not session["start"]:
+        return "No active timer to pause."
+    now = datetime.utcnow()
+    session["elapsed"] += now - session["start"]
+    session["start"] = None
+    return f"Timer paused. Time so far: {session['elapsed']}."
+
+def unpause_timer(user_id):
+    session = active_sessions.get(user_id)
+    if not session or session["start"]:
+        return "No paused timer to resume."
+    session["start"] = datetime.utcnow()
+    return "Timer resumed."
+
+def stop_timer(user_id):
+    session = active_sessions.get(user_id)
+    if not session:
+        return "No active session to stop."
+    now = datetime.utcnow()
+    if session["start"]:
+        session["elapsed"] += now - session["start"]
+    total_time = session["elapsed"]
+    hours = round(total_time.total_seconds() / 3600, 2)
+    waiting_for_memo[user_id] = hours
+    del active_sessions[user_id]
+    return f"Timer stopped. {hours} hours recorded.\nPlease type a short memo to log this session."
+
+def log_memo(user_id, memo):
+    hours = waiting_for_memo.pop(user_id)
+    now = datetime.utcnow().isoformat()
+    entry = {
+        "time_spent_hours": hours,
+        "memo": memo,
+        "timestamp": now
+    }
+    save_log(user_id, entry)
+    return f"Memo saved for {hours} hours: {memo}"
+
+# === Admin View ===
+def gather_all_logs():
+    output = []
+    for user_dir in os.listdir(DATA_DIR):
+        user_id = user_dir.replace("_", ":")
+        full_path = os.path.join(DATA_DIR, user_dir)
+        if not os.path.isdir(full_path):
+            continue
+        for filename in sorted(os.listdir(full_path)):
+            if filename.endswith(".json"):
+                with open(os.path.join(full_path, filename), "r") as f:
+                    logs = json.load(f)
+                    for log in logs:
+                        output.append(f"{user_id} | {filename[:-5]} | {log['time_spent_hours']} hrs | {log['memo']}")
+    if not output:
+        return "No time logs found."
+    return "\n".join(output)
+
+# === Matrix Handling ===
+async def message_callback(room: MatrixRoom, event: RoomMessageText):
+    sender = event.sender
+    msg = event.body.strip()
+    display_name = get_display_name(room, sender).lower()
+
+    if sender == client.user:
+        return  # Don't respond to self
+
+    # Handle waiting memo
+    if sender in waiting_for_memo:
+        response = log_memo(sender, msg)
+        await send_message(room.room_id, response)
+        return
+
+    command = msg.lower()
+
+    if command == "start":
+        response = start_timer(sender)
+    elif command == "pause":
+        response = pause_timer(sender)
+    elif command == "unpause":
+        response = unpause_timer(sender)
+    elif command == "stop":
+        response = stop_timer(sender)
+    elif command == "view":
+        if display_name in VIEW_USERS:
+            response = gather_all_logs()
+        else:
+            response = "You do not have permission to use VIEW."
+    else:
+        response = "Unknown command. Use: START, PAUSE, UNPAUSE, STOP, or VIEW."
+
+    await send_message(room.room_id, response)
+
+async def send_message(room_id, text):
+    # Break up long messages to avoid Matrix limits
+    max_len = 4000
+    chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
+    for chunk in chunks:
+        await client.room_send(
+            room_id,
+            message_type="m.room.message",
+            content={"msgtype": "m.text", "body": chunk}
+        )
+
+async def main():
+    print("Logging in...")
+    resp = await client.login(PASSWORD)
+    if isinstance(resp, LoginResponse):
+        print("Login successful.")
+    else:
+        print(f"Login failed: {resp}")
+        return
+
+    client.add_event_callback(message_callback, RoomMessageText)
+    print("Bot is running. Waiting for commands...")
+    await client.sync_forever(timeout=30000)
+
+if __name__ == "__main__":
+    os.makedirs(DATA_DIR, exist_ok=True)
+    asyncio.run(main())
