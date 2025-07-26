@@ -1,173 +1,235 @@
 import os
-import json
-import asyncio
-from datetime import datetime, timedelta
+import sys
+import time
+import sqlite3
+import csv
+from collections import defaultdict
+from datetime import datetime
 
-from nio import AsyncClient, MatrixRoom, RoomMessageText, LoginResponse
+from authlib.jose import jwt
+import simplematrixbotlib as botlib
 
-# === Configuration ===
-HOMESERVER = "https://your.matrix.server"
-USER_ID = "@timekeeper:your.matrix.server"
-PASSWORD = "yourpassword"
-DATA_DIR = "/opt/matrix-bots/timekeeper-bot/data/"
+import requests
+from datetime import datetime
+import os
 
-# === Privileged Users (can view all data) ===
-VIEW_USERS = {"ben", "eli"}  # Match display name (case-insensitive)
+# === CONFIGURATION ===
+CLOUDREVE_WEBDAV_URL = "https://files.gleipnir.technology/dav/"  # WebDAV root
+CSV_FILE_PATH = "output/logs.csv"  # Local path to your CSV file
 
-# === Internal State ===
-client = AsyncClient(HOMESERVER, USER_ID)
-active_sessions = {}
-waiting_for_memo = {}
+# Your Cloudreve credentials
+CLOUDREVE_USERNAME = "your_username_here"
+CLOUDREVE_PASSWORD = "your_password_here"
 
-# === File Helpers ===
-def get_user_path(user_id):
-    return os.path.join(DATA_DIR, user_id.replace(":", "_"))
+# Generate a unique name for each uploaded file (or just "logs.csv" to overwrite)
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+remote_filename = f"logs_{timestamp}.csv"
 
-def get_day_file(user_id):
-    today = datetime.utcnow().date().isoformat()
-    return os.path.join(get_user_path(user_id), f"{today}.json")
+# Full URL for upload
+upload_url = os.path.join(CLOUDREVE_WEBDAV_URL, remote_filename)
 
-def ensure_user_dir(user_id):
-    os.makedirs(get_user_path(user_id), exist_ok=True)
+# Upload the file via WebDAV (using HTTP Basic Auth)
+with open(CSV_FILE_PATH, "rb") as f:
+    response = requests.put(
+        upload_url,
+        auth=(CLOUDREVE_USERNAME, CLOUDREVE_PASSWORD),
+        data=f
+    )
 
-def save_log(user_id, log_entry):
-    ensure_user_dir(user_id)
-    file = get_day_file(user_id)
-    try:
-        with open(file, "r") as f:
-            logs = json.load(f)
-    except FileNotFoundError:
-        logs = []
-    logs.append(log_entry)
-    with open(file, "w") as f:
-        json.dump(logs, f, indent=2)
+# Check the response
+if response.status_code in [200, 201, 204]:
+    print(f"✅ Upload successful: {remote_filename}")
+else:
+    print(f"❌ Upload failed ({response.status_code}): {response.text}")
 
-def get_display_name(room: MatrixRoom, user_id: str) -> str:
-    member = room.members.get(user_id)
-    return member.display_name if member and member.display_name else user_id
 
-# === Time Tracking ===
-def start_timer(user_id):
-    active_sessions[user_id] = {"start": datetime.utcnow(), "elapsed": timedelta()}
-    return "Timer started."
+PREFIX = "!"
 
-def pause_timer(user_id):
-    session = active_sessions.get(user_id)
-    if not session or not session["start"]:
-        return "No active timer to pause."
-    now = datetime.utcnow()
-    session["elapsed"] += now - session["start"]
-    session["start"] = None
-    return f"Timer paused. Time so far: {session['elapsed']}."
+# === Globals for time tracking ===
+StartTime = 0
+ElapsedTime = 0
+memo_text = ""
 
-def unpause_timer(user_id):
-    session = active_sessions.get(user_id)
-    if not session or session["start"]:
-        return "No paused timer to resume."
-    session["start"] = datetime.utcnow()
-    return "Timer resumed."
+# === Base folder for database and CSV export ===
+BASE_DIR = r"C:\Users\willi\Documents\MatrixBot"
+DB_PATH = os.path.join(BASE_DIR, "worklogs.db")
 
-def stop_timer(user_id):
-    session = active_sessions.get(user_id)
-    if not session:
-        return "No active session to stop."
-    now = datetime.utcnow()
-    if session["start"]:
-        session["elapsed"] += now - session["start"]
-    total_time = session["elapsed"]
-    hours = round(total_time.total_seconds() / 3600, 2)
-    waiting_for_memo[user_id] = hours
-    del active_sessions[user_id]
-    return f"Timer stopped. {hours} hours recorded.\nPlease type a short memo to log this session."
+# === Ensure base folder exists ===
+os.makedirs(BASE_DIR, exist_ok=True)
 
-def log_memo(user_id, memo):
-    hours = waiting_for_memo.pop(user_id)
-    now = datetime.utcnow().isoformat()
-    entry = {
-        "time_spent_hours": hours,
-        "memo": memo,
-        "timestamp": now
-    }
-    save_log(user_id, entry)
-    return f"Memo saved for {hours} hours: {memo}"
+# === Set up the SQLite database ===
+conn = sqlite3.connect(DB_PATH)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT NOT NULL,
+        date TEXT NOT NULL,
+        hours REAL NOT NULL,
+        memo TEXT NOT NULL
+    )
+''')
+conn.commit()
 
-# === Admin View ===
-def gather_all_logs():
-    output = []
-    for user_dir in os.listdir(DATA_DIR):
-        user_id = user_dir.replace("_", ":")
-        full_path = os.path.join(DATA_DIR, user_dir)
-        if not os.path.isdir(full_path):
-            continue
-        for filename in sorted(os.listdir(full_path)):
-            if filename.endswith(".json"):
-                with open(os.path.join(full_path, filename), "r") as f:
-                    logs = json.load(f)
-                    for log in logs:
-                        output.append(f"{user_id} | {filename[:-5]} | {log['time_spent_hours']} hrs | {log['memo']}")
-    if not output:
-        return "No time logs found."
-    return "\n".join(output)
 
-# === Matrix Handling ===
-async def message_callback(room: MatrixRoom, event: RoomMessageText):
-    sender = event.sender
-    msg = event.body.strip()
-    display_name = get_display_name(room, sender).lower()
+def insert_log(user, hours, memo):
+    date = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("INSERT INTO logs (user, date, hours, memo) VALUES (?, ?, ?, ?)",
+                   (user, date, hours, memo))
+    conn.commit()
+    export_aggregated_csv()  # Export CSV after every insert
 
-    if sender == client.user:
-        return  # Don't respond to self
 
-    # Handle waiting memo
-    if sender in waiting_for_memo:
-        response = log_memo(sender, msg)
-        await send_message(room.room_id, response)
-        return
+def export_aggregated_csv():
+    cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
+    rows = cursor.fetchall()
 
-    command = msg.lower()
+    # Aggregate logs by (user, date)
+    aggregate = defaultdict(lambda: {"hours": 0, "memo": ""})
 
-    if command == "start":
-        response = start_timer(sender)
-    elif command == "pause":
-        response = pause_timer(sender)
-    elif command == "unpause":
-        response = unpause_timer(sender)
-    elif command == "stop":
-        response = stop_timer(sender)
-    elif command == "view":
-        if display_name in VIEW_USERS:
-            response = gather_all_logs()
+    for user, date, hours, memo in rows:
+        aggregate[(user, date)]["hours"] += hours
+        if memo.strip():
+            if aggregate[(user, date)]["memo"]:
+                aggregate[(user, date)]["memo"] += "\n" + memo.strip()
+            else:
+                aggregate[(user, date)]["memo"] = memo.strip()
+
+    csv_path = os.path.join(BASE_DIR, "worklogs_export.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        fieldnames = ["User", "Date", "Hours", "Memo"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for (user, date), data in aggregate.items():
+            writer.writerow({
+                "User": user,
+                "Date": date,
+                "Hours": round(data["hours"], 4),
+                "Memo": data["memo"]
+            })
+
+
+def get_token() -> str:
+    token = os.environ.get("BOT_TOKEN")
+    if token is None:
+        try:
+            with open("token.txt", "r") as f:
+                token = f.read().strip()
+                return token
+        except OSError as e:
+            print(f"Failed to read token: {e}")
+        print("You must supply a BOT_TOKEN via environment variable or via token.txt")
+        sys.exit(1)
+    return token
+
+
+def main() -> None:
+    global StartTime, ElapsedTime, memo_text
+
+    token = get_token()
+    print(f"Token: {token}")
+    creds = botlib.Creds(
+        homeserver="https://matrix.gleipnir.technology",
+        username="timecarder",
+        access_token=token,
+        session_stored_file="session.txt",
+    )
+
+    bot = botlib.Bot(creds)
+
+    @bot.listener.on_message_event
+    async def command_handler(room, message):
+        global StartTime, ElapsedTime, memo_text
+
+        match = botlib.MessageMatch(room, message, bot, PREFIX)
+        sender = message.sender
+
+        if not match.is_not_from_this_bot() or not match.prefix():
+            return
+
+        if match.command("START"):
+            StartTime = time.time()
+            ElapsedTime = 0
+            await bot.api.send_text_message(room.room_id, "🟢 Timer started. Don't mess it up.")
+
+        elif match.command("PAUSE"):
+            if StartTime == 0:
+                await bot.api.send_text_message(room.room_id, "😤 You need to START before you PAUSE.")
+                return
+            ElapsedTime += time.time() - StartTime
+            StartTime = 0
+            await bot.api.send_text_message(room.room_id, f"⏸️ Paused at {ElapsedTime:.2f} seconds.")
+
+        elif match.command("UNPAUSE"):
+            if StartTime != 0:
+                await bot.api.send_text_message(room.room_id, "😬 It's already running, genius.")
+                return
+            StartTime = time.time()
+            await bot.api.send_text_message(room.room_id, f"▶️ Resumed. Keep going.")
+
+        elif match.command("STOP"):
+            if StartTime != 0:
+                ElapsedTime += time.time() - StartTime
+                StartTime = 0
+            hours = ElapsedTime / 3600
+            insert_log(sender, hours, memo_text.strip())
+            await bot.api.send_text_message(room.room_id, f"⏹️ Logged {hours:.2f} hours. Well done?")
+            ElapsedTime = 0
+            memo_text = ""
+
+        elif match.command("MEMO"):
+            new_memo = " ".join(match.args()).strip()
+            if new_memo:
+                timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+                memo_text += f"{timestamp} {new_memo}\n"
+                await bot.api.send_text_message(room.room_id, "📝 Memo added. You're a poet now.")
+            else:
+                await bot.api.send_text_message(room.room_id, "😐 That was... empty. Try again with actual words.")
+
+        elif match.command("VIEW"):
+            if any(name in sender for name in ["@williamribble:gleipnir.technology", "Eli"]):
+                cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
+                rows = cursor.fetchall()
+                if not rows:
+                    await bot.api.send_text_message(room.room_id, "No logs to show. Work harder, slackers.")
+                    return
+
+                # Format output as a simple text table (not too big)
+                text = "🗂️ **All Worklogs:**\n\n"
+                current_user = None
+                for user, date, hours, memo in rows:
+                    if user != current_user:
+                        text += f"\n👤 {user}\n"
+                        current_user = user
+                    text += f"  📅 {date}: {hours:.2f}h\n"
+                    text += f"    📝 {memo.replace(chr(10), chr(10)+'    ')}\n"
+                if len(text) < 4000:
+                    await bot.api.send_text_message(room.room_id, text)
+                else:
+                    parts = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+                    for part in parts:
+                        await bot.api.send_text_message(room.room_id, part)
+            else:
+                await bot.api.send_text_message(room.room_id, "🚫 Nope. Not your business.")
+
+        elif match.command("HELP"):
+            await bot.api.send_text_message(
+                room.room_id,
+                "**📚 Timecarder Cheat Sheet**\n"
+                "`!START` - Clock in.\n"
+                "`!PAUSE` - Nap break.\n"
+                "`!UNPAUSE` - Back to hustle.\n"
+                "`!STOP` - Clock out.\n"
+                "`!MEMO` - Add context to your genius.\n"
+                "`!VIEW` - Boss-only overview.\n"
+                "`!HELP` - Duh."
+            )
+
         else:
-            response = "You do not have permission to use VIEW."
-    else:
-        response = "Unknown command. Use: START, PAUSE, UNPAUSE, STOP, or VIEW."
+            await bot.api.send_text_message(room.room_id, "❌ Invalid command. You need `!HELP`. Badly.")
 
-    await send_message(room.room_id, response)
+    bot.run()
 
-async def send_message(room_id, text):
-    # Break up long messages to avoid Matrix limits
-    max_len = 4000
-    chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-    for chunk in chunks:
-        await client.room_send(
-            room_id,
-            message_type="m.room.message",
-            content={"msgtype": "m.text", "body": chunk}
-        )
-
-async def main():
-    print("Logging in...")
-    resp = await client.login(PASSWORD)
-    if isinstance(resp, LoginResponse):
-        print("Login successful.")
-    else:
-        print(f"Login failed: {resp}")
-        return
-
-    client.add_event_callback(message_callback, RoomMessageText)
-    print("Bot is running. Waiting for commands...")
-    await client.sync_forever(timeout=30000)
 
 if __name__ == "__main__":
-    os.makedirs(DATA_DIR, exist_ok=True)
-    asyncio.run(main())
+    main()
