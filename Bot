@@ -3,45 +3,10 @@ import sys
 import time
 import sqlite3
 import csv
-from collections import defaultdict
 from datetime import datetime
 
 from authlib.jose import jwt
 import simplematrixbotlib as botlib
-
-import requests
-from datetime import datetime
-import os
-
-# === CONFIGURATION ===
-CLOUDREVE_WEBDAV_URL = "https://files.gleipnir.technology/dav/"  # WebDAV root
-CSV_FILE_PATH = "output/logs.csv"  # Local path to your CSV file
-
-# Your Cloudreve credentials
-CLOUDREVE_USERNAME = "your_username_here"
-CLOUDREVE_PASSWORD = "your_password_here"
-
-# Generate a unique name for each uploaded file (or just "logs.csv" to overwrite)
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-remote_filename = f"logs_{timestamp}.csv"
-
-# Full URL for upload
-upload_url = os.path.join(CLOUDREVE_WEBDAV_URL, remote_filename)
-
-# Upload the file via WebDAV (using HTTP Basic Auth)
-with open(CSV_FILE_PATH, "rb") as f:
-    response = requests.put(
-        upload_url,
-        auth=(CLOUDREVE_USERNAME, CLOUDREVE_PASSWORD),
-        data=f
-    )
-
-# Check the response
-if response.status_code in [200, 201, 204]:
-    print(f"✅ Upload successful: {remote_filename}")
-else:
-    print(f"❌ Upload failed ({response.status_code}): {response.text}")
-
 
 PREFIX = "!"
 
@@ -50,9 +15,10 @@ StartTime = 0
 ElapsedTime = 0
 memo_text = ""
 
-# === Base folder for database and CSV export ===
+# === Base folder for database and CSV ===
 BASE_DIR = r"C:\Users\willi\Documents\MatrixBot"
 DB_PATH = os.path.join(BASE_DIR, "worklogs.db")
+CSV_FILE_PATH = os.path.join(BASE_DIR, "logs.csv")
 
 # === Ensure base folder exists ===
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -71,43 +37,50 @@ cursor.execute('''
 ''')
 conn.commit()
 
+def export_to_csv():
+    cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
+    rows = cursor.fetchall()
+
+    with open(CSV_FILE_PATH, mode="w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["User", "Date", "Hours", "Memo"])
+        for row in rows:
+            writer.writerow(row)
 
 def insert_log(user, hours, memo):
     date = datetime.now().strftime("%Y-%m-%d")
     cursor.execute("INSERT INTO logs (user, date, hours, memo) VALUES (?, ?, ?, ?)",
                    (user, date, hours, memo))
     conn.commit()
-    export_aggregated_csv()  # Export CSV after every insert
+    export_to_csv()  # Export fresh CSV after every insert
 
+def format_table():
+    cursor.execute("SELECT DISTINCT date FROM logs ORDER BY date")
+    dates = [row[0] for row in cursor.fetchall()]
 
-def export_aggregated_csv():
-    cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
-    rows = cursor.fetchall()
+    cursor.execute("SELECT DISTINCT user FROM logs ORDER BY user")
+    users = [row[0] for row in cursor.fetchall()]
 
-    # Aggregate logs by (user, date)
-    aggregate = defaultdict(lambda: {"hours": 0, "memo": ""})
+    table = "🗂️ **Worklog Table**\n\n"
+    header = "User        | " + " | ".join(f"{date}" for date in dates) + "\n"
+    separator = "-------------" + "+".join("---------------" for _ in dates) + "\n"
+    table += header + separator
 
-    for user, date, hours, memo in rows:
-        aggregate[(user, date)]["hours"] += hours
-        if memo.strip():
-            if aggregate[(user, date)]["memo"]:
-                aggregate[(user, date)]["memo"] += "\n" + memo.strip()
+    for user in users:
+        row = f"{user:<12}| "
+        for date in dates:
+            cursor.execute("SELECT hours, memo FROM logs WHERE user = ? AND date = ?", (user, date))
+            logs = cursor.fetchall()
+            if logs:
+                cell = ""
+                for hours, memo in logs:
+                    # Show only first 20 chars of memo with "..." to keep it neat
+                    cell += f"{hours:.1f}h - {memo[:20]}...\n"
+                row += f"{cell.strip():<15}| "
             else:
-                aggregate[(user, date)]["memo"] = memo.strip()
-
-    csv_path = os.path.join(BASE_DIR, "worklogs_export.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
-        fieldnames = ["User", "Date", "Hours", "Memo"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for (user, date), data in aggregate.items():
-            writer.writerow({
-                "User": user,
-                "Date": date,
-                "Hours": round(data["hours"], 4),
-                "Memo": data["memo"]
-            })
-
+                row += f"{'':<15}| "
+        table += row + "\n"
+    return table
 
 def get_token() -> str:
     token = os.environ.get("BOT_TOKEN")
@@ -121,7 +94,6 @@ def get_token() -> str:
         print("You must supply a BOT_TOKEN via environment variable or via token.txt")
         sys.exit(1)
     return token
-
 
 def main() -> None:
     global StartTime, ElapsedTime, memo_text
@@ -187,26 +159,13 @@ def main() -> None:
                 await bot.api.send_text_message(room.room_id, "😐 That was... empty. Try again with actual words.")
 
         elif match.command("VIEW"):
-            if any(name in sender for name in ["@williamribble:gleipnir.technology", "Eli"]):
-                cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
-                rows = cursor.fetchall()
-                if not rows:
-                    await bot.api.send_text_message(room.room_id, "No logs to show. Work harder, slackers.")
-                    return
-
-                # Format output as a simple text table (not too big)
-                text = "🗂️ **All Worklogs:**\n\n"
-                current_user = None
-                for user, date, hours, memo in rows:
-                    if user != current_user:
-                        text += f"\n👤 {user}\n"
-                        current_user = user
-                    text += f"  📅 {date}: {hours:.2f}h\n"
-                    text += f"    📝 {memo.replace(chr(10), chr(10)+'    ')}\n"
-                if len(text) < 4000:
-                    await bot.api.send_text_message(room.room_id, text)
+            # Only allow specific users to view logs
+            if any(name in sender for name in ["@williamribble:gleipnir.technology", "@eliribble:gl"]):
+                table = format_table()
+                if len(table) < 4000:
+                    await bot.api.send_text_message(room.room_id, table)
                 else:
-                    parts = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+                    parts = [table[i:i + 3900] for i in range(0, len(table), 3900)]
                     for part in parts:
                         await bot.api.send_text_message(room.room_id, part)
             else:
@@ -229,7 +188,6 @@ def main() -> None:
             await bot.api.send_text_message(room.room_id, "❌ Invalid command. You need `!HELP`. Badly.")
 
     bot.run()
-
 
 if __name__ == "__main__":
     main()
