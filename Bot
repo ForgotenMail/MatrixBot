@@ -1,193 +1,162 @@
-import os
-import sys
-import time
-import sqlite3
-import csv
-from datetime import datetime
 
-from authlib.jose import jwt
-import simplematrixbotlib as botlib
+import asyncio
+import aiosqlite
+from datetime import datetime, timedelta
+from nio import AsyncClient, RoomMessageText
 
-PREFIX = "!"
+DB_FILE = "sessionstate.db"
 
-# === Globals for time tracking ===
-StartTime = 0
-ElapsedTime = 0
-memo_text = ""
+class SessionState:
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    STOPPED = "STOPPED"
+    MANUAL_ENTRY = "MANUAL_ENTRY"
 
-# === Base folder for database and CSV ===
-BASE_DIR = r"C:\Users\willi\Documents\MatrixBot"
-DB_PATH = os.path.join(BASE_DIR, "worklogs.db")
-CSV_FILE_PATH = os.path.join(BASE_DIR, "logs.csv")
+class Bot:
+    def __init__(self, homeserver, user_id, access_token):
+        self.client = AsyncClient(homeserver, user_id)
+        self.client.access_token = access_token
+        self.client.add_event_callback(self.message_callback, RoomMessageText)
+        self.state = SessionState.IDLE
+        self.start_time = None
+        self.manual_entry_time = None
+        self.paused = False
 
-# === Ensure base folder exists ===
-os.makedirs(BASE_DIR, exist_ok=True)
+    async def log_command(self, user_id, command, state):
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS session_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+            ''')
+            await db.execute('''
+                INSERT INTO session_state (user_id, command, state, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, command.upper(), state.upper(), datetime.utcnow().isoformat()))
+            await db.commit()
 
-# === Set up the SQLite database ===
-conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user TEXT NOT NULL,
-        date TEXT NOT NULL,
-        hours REAL NOT NULL,
-        memo TEXT NOT NULL
-    )
-''')
-conn.commit()
+    async def send(self, room, message):
+        await self.client.room_send(
+            room_id=room,
+            message_type="m.room.message",
+            content={"msgtype": "m.text", "body": message}
+        )
 
-def export_to_csv():
-    cursor.execute("SELECT user, date, hours, memo FROM logs ORDER BY user, date")
-    rows = cursor.fetchall()
+    async def message_callback(self, room, event):
+        if event.sender == self.client.user: return
 
-    with open(CSV_FILE_PATH, mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["User", "Date", "Hours", "Memo"])
-        for row in rows:
-            writer.writerow(row)
+        msg = event.body.strip().replace(" ", "").lower()
+        command = msg.split()[0] if " " in msg else msg
 
-def insert_log(user, hours, memo):
-    date = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("INSERT INTO logs (user, date, hours, memo) VALUES (?, ?, ?, ?)",
-                   (user, date, hours, memo))
-    conn.commit()
-    export_to_csv()  # Export fresh CSV after every insert
+        # Make command detection more robust
+        content = event.body.strip().lower().replace("!", "")
+        args = content.split()
+        command = args[0] if args else ""
+        command = command.lower()
 
-def format_table():
-    cursor.execute("SELECT DISTINCT date FROM logs ORDER BY date")
-    dates = [row[0] for row in cursor.fetchall()]
-
-    cursor.execute("SELECT DISTINCT user FROM logs ORDER BY user")
-    users = [row[0] for row in cursor.fetchall()]
-
-    table = "🗂️ **Worklog Table**\n\n"
-    header = "User        | " + " | ".join(f"{date}" for date in dates) + "\n"
-    separator = "-------------" + "+".join("---------------" for _ in dates) + "\n"
-    table += header + separator
-
-    for user in users:
-        row = f"{user:<12}| "
-        for date in dates:
-            cursor.execute("SELECT hours, memo FROM logs WHERE user = ? AND date = ?", (user, date))
-            logs = cursor.fetchall()
-            if logs:
-                cell = ""
-                for hours, memo in logs:
-                    # Show only first 20 chars of memo with "..." to keep it neat
-                    cell += f"{hours:.1f}h - {memo[:20]}...\n"
-                row += f"{cell.strip():<15}| "
-            else:
-                row += f"{'':<15}| "
-        table += row + "\n"
-    return table
-
-def get_token() -> str:
-    token = os.environ.get("BOT_TOKEN")
-    if token is None:
-        try:
-            with open("token.txt", "r") as f:
-                token = f.read().strip()
-                return token
-        except OSError as e:
-            print(f"Failed to read token: {e}")
-        print("You must supply a BOT_TOKEN via environment variable or via token.txt")
-        sys.exit(1)
-    return token
-
-def main() -> None:
-    global StartTime, ElapsedTime, memo_text
-
-    token = get_token()
-    print(f"Token: {token}")
-    creds = botlib.Creds(
-        homeserver="https://matrix.gleipnir.technology",
-        username="timecarder",
-        access_token=token,
-        session_stored_file="session.txt",
-    )
-
-    bot = botlib.Bot(creds)
-
-    @bot.listener.on_message_event
-    async def command_handler(room, message):
-        global StartTime, ElapsedTime, memo_text
-
-        match = botlib.MessageMatch(room, message, bot, PREFIX)
-        sender = message.sender
-
-        if not match.is_not_from_this_bot() or not match.prefix():
-            return
-
-        if match.command("START"):
-            StartTime = time.time()
-            ElapsedTime = 0
-            await bot.api.send_text_message(room.room_id, "🟢 Timer started. Don't mess it up.")
-
-        elif match.command("PAUSE"):
-            if StartTime == 0:
-                await bot.api.send_text_message(room.room_id, "😤 You need to START before you PAUSE.")
+        if command in ("start", "!start"):
+            if self.state == SessionState.RUNNING:
+                await self.send(room.room_id, "Already started.")
                 return
-            ElapsedTime += time.time() - StartTime
-            StartTime = 0
-            await bot.api.send_text_message(room.room_id, f"⏸️ Paused at {ElapsedTime:.2f} seconds.")
+            self.state = SessionState.RUNNING
+            self.start_time = datetime.now()
+            await self.send(room.room_id, "Timer started.")
+            await self.log_command(event.sender, "START", self.state)
 
-        elif match.command("UNPAUSE"):
-            if StartTime != 0:
-                await bot.api.send_text_message(room.room_id, "😬 It's already running, genius.")
+        elif command in ("pause", "!pause"):
+            if self.state != SessionState.RUNNING:
+                await self.send(room.room_id, "Cannot pause. Not currently running.")
                 return
-            StartTime = time.time()
-            await bot.api.send_text_message(room.room_id, f"▶️ Resumed. Keep going.")
+            self.state = SessionState.PAUSED
+            await self.send(room.room_id, "Timer paused.")
+            await self.log_command(event.sender, "PAUSE", self.state)
 
-        elif match.command("STOP"):
-            if StartTime != 0:
-                ElapsedTime += time.time() - StartTime
-                StartTime = 0
-            hours = ElapsedTime / 3600
-            insert_log(sender, hours, memo_text.strip())
-            await bot.api.send_text_message(room.room_id, f"⏹️ Logged {hours:.2f} hours. Well done?")
-            ElapsedTime = 0
-            memo_text = ""
+        elif command in ("unpause", "!unpause"):
+            if self.state != SessionState.PAUSED:
+                await self.send(room.room_id, "Cannot unpause unless paused.")
+                return
+            self.state = SessionState.RUNNING
+            await self.send(room.room_id, "Timer resumed.")
+            await self.log_command(event.sender, "UNPAUSE", self.state)
 
-        elif match.command("MEMO"):
-            new_memo = " ".join(match.args()).strip()
-            if new_memo:
-                timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-                memo_text += f"{timestamp} {new_memo}\n"
-                await bot.api.send_text_message(room.room_id, "📝 Memo added. You're a poet now.")
-            else:
-                await bot.api.send_text_message(room.room_id, "😐 That was... empty. Try again with actual words.")
+        elif command in ("stop", "!stop"):
+            if self.state not in (SessionState.RUNNING, SessionState.PAUSED):
+                await self.send(room.room_id, "Timer is not running.")
+                return
+            self.state = SessionState.STOPPED
+            await self.send(room.room_id, "Timer stopped.")
+            await self.log_command(event.sender, "STOP", self.state)
 
-        elif match.command("VIEW"):
-            # Only allow specific users to view logs
-            if any(name in sender for name in ["@williamribble:gleipnir.technology", "@eliribble:gl"]):
-                table = format_table()
-                if len(table) < 4000:
-                    await bot.api.send_text_message(room.room_id, table)
-                else:
-                    parts = [table[i:i + 3900] for i in range(0, len(table), 3900)]
-                    for part in parts:
-                        await bot.api.send_text_message(room.room_id, part)
-            else:
-                await bot.api.send_text_message(room.room_id, "🚫 Nope. Not your business.")
+        elif command in ("manualstart", "!manualstart") and len(args) >= 2:
+            try:
+                dt = datetime.strptime(args[1], "%m:%d:%H:%M")
+                elapsed = datetime.now() - dt
+                self.state = SessionState.RUNNING
+                self.start_time = datetime.now() - elapsed
+                await self.send(room.room_id, f"Manual start accepted. Elapsed time: {str(elapsed).split('.')[0]}")
+                await self.log_command(event.sender, "MANUALSTART", self.state)
+            except Exception as e:
+                await self.send(room.room_id, f"Invalid manual start time. Use MM:DD:HH:MM (e.g., 07:31:13:52)")
 
-        elif match.command("HELP"):
-            await bot.api.send_text_message(
-                room.room_id,
-                "**📚 Timecarder Cheat Sheet**\n"
-                "`!START` - Clock in.\n"
-                "`!PAUSE` - Nap break.\n"
-                "`!UNPAUSE` - Back to hustle.\n"
-                "`!STOP` - Clock out.\n"
-                "`!MEMO` - Add context to your genius.\n"
-                "`!VIEW` - Boss-only overview.\n"
-                "`!HELP` - Duh."
+        elif command in ("manualpause", "!manualpause"):
+            self.state = SessionState.PAUSED
+            await self.send(room.room_id, "Manual pause accepted.")
+            await self.log_command(event.sender, "MANUALPAUSE", self.state)
+
+        elif command in ("manualstop", "!manualstop"):
+            self.state = SessionState.STOPPED
+            await self.send(room.room_id, "Manual stop accepted.")
+            await self.log_command(event.sender, "MANUALSTOP", self.state)
+
+        elif command in ("memo", "!memo"):
+            if self.state == SessionState.IDLE:
+                await self.send(room.room_id, "Start a session before using memos.")
+                return
+            memo_text = " ".join(args[1:]) if len(args) > 1 else "[No text]"
+            await self.send(room.room_id, f"Memo saved: {memo_text}")
+            await self.log_command(event.sender, "MEMO", self.state)
+
+        elif command in ("help", "!help"):
+            help_text = (
+                "Commands:\n"
+                "!start - Start timer\n"
+                "!pause - Pause timer\n"
+                "!unpause - Resume timer\n"
+                "!stop - Stop timer\n"
+                "!manualstart MM:DD:HH:MM - Start from specific time\n"
+                "!manualpause - Manually pause\n"
+                "!manualstop - Manually stop\n"
+                "!memo [text] - Save memo\n"
+                "!help - Show this help"
             )
+            await self.send(room.room_id, help_text)
 
-        else:
-            await bot.api.send_text_message(room.room_id, "❌ Invalid command. You need `!HELP`. Badly.")
+    async def run(self):
+        await self.client.sync_forever(timeout=30000)
 
-    bot.run()
+# ------------------------ ENTRY ------------------------
+
+async def main():
+    # Replace with your own login method here:
+    homeserver = "https://matrix.gleipnir.technology"
+    user_id = "@timecarder:matrix.org"
+    access_token = "syt_dGltZWNhcmRlcg_MdrLifILhYCdSuwmLjWh_183A1i"
+
+    bot = Bot(homeserver, user_id, access_token)
+    await bot.run()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
+
+
+
+
+
+
+
